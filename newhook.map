@@ -1,0 +1,11 @@
+NEWHOOK_1.0 {
+  global:
+    newhook_init;
+    newhook_hook_func_addr;
+    newhook_hook_sym_name;
+    newhook_unhook;
+    newhook_get_errno;
+    newhook_strerror;
+  local:
+    *;
+};

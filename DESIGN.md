@@ -1068,13 +1068,14 @@ int main() {
 | 决策 | 选择 | 理由 |
 |------|------|------|
 | 架构支持 | 仅 ARM64 | 需求限定，减少代码量和条件编译 |
-| Hook 模式 | UNIQUE | 单一 hook 足够，避免 Hub 复杂性 |
+| Hook 模式 | UNIQUE / MULTI / SHARED | 覆盖全部使用场景 |
 | 跳板寄存器 | X17 (IP1) | ARM64 ABI 规定的临时寄存器，不影响调用约定 |
 | 内存管理 | 页内分块 | 减少 mmap 系统调用，高效复用 |
 | 线程安全 | mutex + atomic | 简洁可靠，hook 操作非高频 |
-| **符号解析** | **dl_iterate_phdr + .dynsym** | **去除 xdl/soinfo 依赖，纯标准 API** |
-| **linker 监控** | **完全去除** | **消除 nothing.so 依赖，实现纯静态库** |
-| **延迟 hook** | **不支持** | **代价：调用方须确保库已加载；收益：无 .so 依赖** |
+| 符号解析 | dl_iterate_phdr + .dynsym | 去除 xdl/soinfo 依赖，纯标准 API |
+| linker 监控 | 可选 (opt-in) | 默认无依赖；需要延迟 hook 时手动启用 |
+| soinfo 偏移 | 硬编码 | 通过 soinfo_parse + offsetof 双重验证，无需 nothing.so |
+| 延迟 hook | pending task 系统 | 库加载时自动激活，需先启用 linker monitor |
 | 延迟释放 | 10 秒时间戳 | 平衡安全性和内存回收效率 |
 | 信号保护 | sigsetjmp/siglongjmp | 处理意外 SIGSEGV，不依赖外部库 |
 
@@ -1095,3 +1096,172 @@ newhook 的解决:
                    直接 link 到宿主 .so 或可执行文件即可
                    UE4 集成: 在 Build.cs 中 add_library + target_link_libraries 即可
 ```
+
+---
+
+## 10. MULTI / SHARED 模式架构
+
+### 10.1 nh_switch — per-address 状态管理
+
+`nh_switch` 是 newhook 的核心调度模块，管理每个目标地址的 hook 状态。参考 shadowhook 的 `sh_switch.c`。
+
+```
+newhook_hook_func_addr_ex(target, new_func, &orig, mode)
+  │
+  └─ nh_switch_hook(target, new_func, &orig, mode, sym_size)
+       │
+       ├─ find_switch(target)  ← 查找已有 switch
+       │
+       ├─ mode == UNIQUE:
+       │    ├─ 已有 switch → NH_ERR_ALREADY_HOOKED
+       │    └─ 新建 switch + nh_hook_install → 返回 handle
+       │
+       ├─ mode == MULTI:
+       │    ├─ 已有 UNIQUE switch → NH_ERR_MODE_CONFLICT
+       │    ├─ 首次: 新建 switch + proxy, nh_hook_install 指向 proxy->new_addr
+       │    └─ 后续: 追加 proxy 到链尾, 原子更新 prev->orig_addr
+       │
+       └─ mode == SHARED:
+            ├─ 已有 UNIQUE switch → NH_ERR_MODE_CONFLICT
+            ├─ 首次: 新建 switch + hub, nh_hook_install 指向 hub trampoline
+            └─ 后续: hub_add_proxy(new_func)
+```
+
+### 10.2 MULTI 模式 — 指针链
+
+MULTI 模式通过 `orig_func` 指针实现链式调用，与 shadowhook 的 `sh_switch_proxy_add/del` 完全一致。
+
+```
+调用流程 (3 个 hook):
+
+  目标函数入口
+    │ (被 patch 为跳转到 hook1)
+    ▼
+  hook1(x)
+    │ orig1 ──→ hook2
+    ▼
+  hook2(x)
+    │ orig2 ──→ hook3
+    ▼
+  hook3(x)
+    │ orig3 ──→ 原始函数 (enter trampoline)
+    ▼
+  原始函数
+```
+
+unhook 中间节点时，原子更新前一个节点的 `orig_addr` 跳过被移除的节点：
+
+```
+unhook hook2:
+  before: orig1 → hook2, orig2 → hook3
+  after:  orig1 → hook3  (atomic store)
+```
+
+### 10.3 SHARED 模式 — Hub 代理
+
+SHARED 模式使用 hub trampoline 作为统一入口，通过 TLS per-thread stack 管理调用链。参考 shadowhook 的 `sh_hub.c`。
+
+```
+调用流程:
+
+  目标函数入口
+    │ (被 patch 为跳转到 hub trampoline)
+    ▼
+  Hub Trampoline (nh_hub_trampo.S):
+    │ 1. 保存 x0-x8, lr, q0-q7 到栈
+    │ 2. 调用 nh_hub_push_stack_impl(hub, lr)
+    │    → 获取 TLS stack, 推入 frame, 返回第一个 enabled proxy
+    │ 3. 恢复所有寄存器
+    │ 4. br x16 → 跳转到 proxy
+    ▼
+  proxy_a(x)
+    │ newhook_get_prev_func(proxy_a) → proxy_b
+    ▼
+  proxy_b(x)
+    │ newhook_get_prev_func(proxy_b) → 原始函数
+    ▼
+  原始函数
+```
+
+Hub 数据结构：
+
+```c
+nh_hub_t {
+  proxies → [proxy_a(enabled)] → [proxy_b(enabled)] → NULL
+  orig_addr = enter trampoline (原始函数)
+  trampo = hub trampoline 地址
+}
+
+nh_hub_stack_t (TLS, per-thread) {
+  frames[0] = { proxies snapshot, orig_addr, return_address }
+  frames_cnt = 1
+}
+```
+
+unhook 时仅将 proxy 的 `enabled` 设为 false（不从链表移除），遍历时自动跳过。
+
+---
+
+## 11. Linker 监控架构
+
+### 11.1 nh_linker — hook linker64
+
+newhook 的 linker 监控不依赖 nothing.so 运行时扫描，而是使用硬编码的 soinfo 偏移（通过 `soinfoparse` 工具验证）。
+
+```
+newhook_init_linker_monitor()
+  │
+  ├─ nh_linker_init()
+  │    ├─ 从 /proc/self/maps 获取 linker64 基址和路径
+  │    ├─ mmap linker64 ELF, 从 .symtab 查找:
+  │    │    __dl__ZN6soinfo17call_constructorsEv
+  │    │    __dl__ZN6soinfo16call_destructorsEv
+  │    ├─ 计算运行时地址 = 基址 + 偏移
+  │    └─ newhook_hook_func_addr() hook 两个函数
+  │
+  └─ nh_task_init()
+       └─ 注册 dl_init pre-callback → task_dl_init_pre
+```
+
+### 11.2 soinfo 硬编码偏移
+
+在 `nh_soinfo.h` 中定义，通过两种方式验证：
+
+1. `soinfo_parse` — 在设备上 hook call_constructors，拿到 soinfo 指针后内存扫描
+2. `soinfo_calc` — 用 `offsetof` 对镜像结构体计算
+
+```
+ARM64 LP64 soinfo 偏移 (Android 16 API 36):
+  [  0] phdr
+  [  8] phnum
+  [208] link_map.l_addr (== load_bias)
+  [216] link_map.l_name
+  [248] constructors_called
+  [256] load_bias
+```
+
+### 11.3 nh_task — 延迟 Hook
+
+```
+newhook_hook_sym_name_ex("libfoo.so", "func", ...)
+  │
+  ├─ nh_symbol_find() → 失败 (库未加载)
+  │
+  ├─ linker monitor 已启用?
+  │    ├─ 是 → nh_task_create() → 返回 task handle (errno=NH_ERR_PENDING)
+  │    └─ 否 → 返回 NULL (errno=NH_ERR_SYMBOL_NOT_FOUND)
+  │
+  ... 稍后 libfoo.so 被 dlopen ...
+  │
+  linker proxy_call_constructors(soinfo)
+    │ nh_soinfo_to_dlinfo(soinfo, &dlinfo)
+    │ 触发 dl_init pre-callbacks
+    ▼
+  task_dl_init_pre(dlinfo)
+    │ 遍历 pending tasks
+    │ 匹配 lib_name → nh_symbol_find() → 成功
+    │ nh_switch_hook() → 安装 hook
+    └─ task.is_finished = true
+```
+
+unhook 时自动检测 handle 类型（task magic `0x4E485441`），如果是 task 则调用 `nh_task_destroy`，内部会 unhook 已激活的 switch。

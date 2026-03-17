@@ -6,11 +6,14 @@
 #include <string.h>
 
 #include "nh_enter.h"
-#include "nh_hook.h"
+#include "nh_hub.h"
 #include "nh_island.h"
+#include "nh_linker.h"
 #include "nh_log.h"
 #include "nh_safe.h"
+#include "nh_switch.h"
 #include "nh_symbol.h"
+#include "nh_task.h"
 #include "nh_util.h"
 
 // ============================================================
@@ -19,15 +22,8 @@
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool g_inited = false;
+static bool g_linker_monitor_inited = false;
 static _Thread_local int g_errno = NH_OK;
-
-// Hook handle: wraps nh_hook_t with a linked list node
-typedef struct nh_handle {
-  nh_hook_t hook;
-  struct nh_handle *next;
-} nh_handle_t;
-
-static nh_handle_t *g_handles = NULL;
 
 // ============================================================
 // Error helpers
@@ -43,7 +39,7 @@ static void *fail(int err) {
 }
 
 // ============================================================
-// Public API
+// Public API: init
 // ============================================================
 
 int newhook_init(void) {
@@ -54,16 +50,16 @@ int newhook_init(void) {
     return NH_OK;
   }
 
-  // Initialize signal safety
   if (nh_safe_init() != 0) {
     pthread_mutex_unlock(&g_lock);
     set_errno(NH_ERR_SAFE_INIT);
     return NH_ERR_SAFE_INIT;
   }
 
-  // Initialize memory managers
   nh_enter_init();
   nh_island_init();
+  nh_switch_init();
+  nh_hub_init();
 
   g_inited = true;
   pthread_mutex_unlock(&g_lock);
@@ -72,146 +68,148 @@ int newhook_init(void) {
   return NH_OK;
 }
 
+// ============================================================
+// Public API: hook by address
+// ============================================================
+
 void *newhook_hook_func_addr(void *target_addr, void *new_func, void **orig_func) {
+  return newhook_hook_func_addr_ex(target_addr, new_func, orig_func, NH_MODE_UNIQUE);
+}
+
+void *newhook_hook_func_addr_ex(void *target_addr, void *new_func,
+                                 void **orig_func, int mode) {
   if (!g_inited) return fail(NH_ERR_NOT_INITIALIZED);
   if (target_addr == NULL || new_func == NULL) return fail(NH_ERR_INVALID_ARG);
-  if (((uintptr_t)target_addr & 0x3) != 0) return fail(NH_ERR_INVALID_ARG);  // must be 4-byte aligned
+  if (((uintptr_t)target_addr & 0x3) != 0) return fail(NH_ERR_INVALID_ARG);
 
-  pthread_mutex_lock(&g_lock);
-
-  // Check if already hooked at this address
-  for (nh_handle_t *h = g_handles; h != NULL; h = h->next) {
-    if (h->hook.target_addr == (uintptr_t)target_addr && h->hook.hooked) {
-      pthread_mutex_unlock(&g_lock);
-      return fail(NH_ERR_ALREADY_HOOKED);
-    }
-  }
-
-  // Allocate handle
-  nh_handle_t *handle = calloc(1, sizeof(nh_handle_t));
-  if (handle == NULL) {
-    pthread_mutex_unlock(&g_lock);
-    return fail(NH_ERR_OOM);
-  }
-
-  // Try to get symbol size for the target address (best-effort)
+  // best-effort symbol size lookup
   nh_symbol_info_t sym_info;
   size_t sym_size = 0;
   if (nh_symbol_find_by_addr((uintptr_t)target_addr, &sym_info) == 0) {
     sym_size = sym_info.size;
   }
 
-  // Install the hook
-  // orig_func is passed directly — the strategy sets it BEFORE the patch
-  // takes effect, so the hook callback can use it immediately.
-  int r = nh_hook_install(&handle->hook, (uintptr_t)target_addr,
-                          (uintptr_t)new_func, orig_func, sym_size);
-  if (r != NH_OK) {
-    free(handle);
-    pthread_mutex_unlock(&g_lock);
-    return fail(r);
+  nh_switch_handle_t *handle = nh_switch_hook(
+      (uintptr_t)target_addr, (uintptr_t)new_func, orig_func, mode, sym_size);
+
+  if (!handle) {
+    // determine specific error
+    if (mode == NH_MODE_UNIQUE) {
+      set_errno(NH_ERR_ALREADY_HOOKED);
+    } else if (mode == NH_MODE_SHARED) {
+      set_errno(NH_ERR_HUB);
+    } else {
+      set_errno(NH_ERR_MODE_CONFLICT);
+    }
+    return NULL;
   }
 
-  // Add to global list
-  handle->next = g_handles;
-  g_handles = handle;
-
-  pthread_mutex_unlock(&g_lock);
   set_errno(NH_OK);
   return handle;
 }
+
+// ============================================================
+// Public API: hook by symbol name
+// ============================================================
 
 void *newhook_hook_sym_name(const char *lib_name, const char *sym_name,
                             void *new_func, void **orig_func) {
+  return newhook_hook_sym_name_ex(lib_name, sym_name, new_func, orig_func, NH_MODE_UNIQUE);
+}
+
+void *newhook_hook_sym_name_ex(const char *lib_name, const char *sym_name,
+                                void *new_func, void **orig_func, int mode) {
   if (!g_inited) return fail(NH_ERR_NOT_INITIALIZED);
   if (sym_name == NULL || new_func == NULL) return fail(NH_ERR_INVALID_ARG);
 
-  // Resolve symbol
   nh_symbol_info_t sym_info;
   if (nh_symbol_find(lib_name, sym_name, &sym_info) != 0) {
+    // symbol not found — if linker monitor active, create pending task
+    if (g_linker_monitor_inited && lib_name != NULL) {
+      nh_task_t *task = nh_task_create(lib_name, sym_name,
+                                       (uintptr_t)new_func, orig_func, mode);
+      if (task) {
+        set_errno(NH_ERR_PENDING);
+        return task;
+      }
+    }
     return fail(NH_ERR_SYMBOL_NOT_FOUND);
   }
 
-  pthread_mutex_lock(&g_lock);
+  nh_switch_handle_t *handle = nh_switch_hook(
+      sym_info.addr, (uintptr_t)new_func, orig_func, mode, sym_info.size);
 
-  // Check if already hooked
-  for (nh_handle_t *h = g_handles; h != NULL; h = h->next) {
-    if (h->hook.target_addr == sym_info.addr && h->hook.hooked) {
-      pthread_mutex_unlock(&g_lock);
-      return fail(NH_ERR_ALREADY_HOOKED);
+  if (!handle) {
+    if (mode == NH_MODE_UNIQUE) {
+      set_errno(NH_ERR_ALREADY_HOOKED);
+    } else {
+      set_errno(NH_ERR_MODE_CONFLICT);
     }
+    return NULL;
   }
 
-  // Allocate handle
-  nh_handle_t *handle = calloc(1, sizeof(nh_handle_t));
-  if (handle == NULL) {
-    pthread_mutex_unlock(&g_lock);
-    return fail(NH_ERR_OOM);
-  }
-
-  // Install the hook
-  // orig_func is passed directly — set before patch takes effect.
-  int r = nh_hook_install(&handle->hook, sym_info.addr,
-                          (uintptr_t)new_func, orig_func, sym_info.size);
-  if (r != NH_OK) {
-    free(handle);
-    pthread_mutex_unlock(&g_lock);
-    return fail(r);
-  }
-
-  handle->next = g_handles;
-  g_handles = handle;
-
-  pthread_mutex_unlock(&g_lock);
   set_errno(NH_OK);
   return handle;
 }
+
+// ============================================================
+// Public API: unhook
+// ============================================================
 
 int newhook_unhook(void *h) {
   if (!g_inited) { set_errno(NH_ERR_NOT_INITIALIZED); return NH_ERR_NOT_INITIALIZED; }
   if (h == NULL) { set_errno(NH_ERR_INVALID_ARG); return NH_ERR_INVALID_ARG; }
 
-  nh_handle_t *handle = (nh_handle_t *)h;
-
-  pthread_mutex_lock(&g_lock);
-
-  // Verify handle is in our list
-  bool found = false;
-  for (nh_handle_t *p = g_handles; p != NULL; p = p->next) {
-    if (p == handle) { found = true; break; }
-  }
-  if (!found) {
-    pthread_mutex_unlock(&g_lock);
-    set_errno(NH_ERR_NOT_HOOKED);
-    return NH_ERR_NOT_HOOKED;
-  }
-
-  // Uninstall
-  int r = nh_hook_uninstall(&handle->hook);
-  if (r != NH_OK) {
-    pthread_mutex_unlock(&g_lock);
+  // check if this is a pending task handle
+  if (nh_task_is_task(h)) {
+    int r = nh_task_destroy((nh_task_t *)h);
     set_errno(r);
     return r;
   }
 
-  // Remove from list
-  if (g_handles == handle) {
-    g_handles = handle->next;
-  } else {
-    for (nh_handle_t *p = g_handles; p != NULL; p = p->next) {
-      if (p->next == handle) {
-        p->next = handle->next;
-        break;
-      }
-    }
-  }
+  int r = nh_switch_unhook((nh_switch_handle_t *)h);
+  set_errno(r);
+  return r;
+}
 
-  free(handle);
+// ============================================================
+// Public API: linker monitor (stub)
+// ============================================================
 
-  pthread_mutex_unlock(&g_lock);
+int newhook_init_linker_monitor(void) {
+  if (!g_inited) { set_errno(NH_ERR_NOT_INITIALIZED); return NH_ERR_NOT_INITIALIZED; }
+  if (g_linker_monitor_inited) { set_errno(NH_OK); return NH_OK; }
+
+  int r = nh_linker_init();
+  if (r != 0) { set_errno(NH_ERR_LINKER_INIT); return NH_ERR_LINKER_INIT; }
+
+  r = nh_task_init();
+  if (r != 0) { set_errno(NH_ERR_LINKER_INIT); return NH_ERR_LINKER_INIT; }
+
+  g_linker_monitor_inited = true;
   set_errno(NH_OK);
   return NH_OK;
 }
+
+// ============================================================
+// Public API: SHARED mode helpers
+// ============================================================
+
+void *newhook_get_prev_func(void *func) {
+  return nh_hub_get_prev_func(func);
+}
+
+void newhook_pop_stack(void *return_address) {
+  nh_hub_pop_stack(return_address);
+}
+
+void *newhook_get_return_address(void) {
+  return nh_hub_get_return_address();
+}
+
+// ============================================================
+// Public API: error
+// ============================================================
 
 int newhook_get_errno(void) {
   return g_errno;
@@ -233,6 +231,11 @@ const char *newhook_strerror(int errnum) {
     case NH_ERR_PATCH:           return "failed to patch target";
     case NH_ERR_SAFE_INIT:       return "signal handler init failed";
     case NH_ERR_OOM:             return "out of memory";
+    case NH_ERR_MODE_CONFLICT:   return "hook mode conflict on same address";
+    case NH_ERR_HUB:             return "hub creation/operation failed";
+    case NH_ERR_PENDING:         return "hook pending (library not loaded)";
+    case NH_ERR_DUP:             return "duplicate hook";
+    case NH_ERR_LINKER_INIT:     return "linker monitor init failed";
     default:                     return "unknown error";
   }
 }

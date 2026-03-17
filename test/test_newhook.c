@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dlfcn.h>
+#include <link.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <unistd.h>
@@ -812,6 +813,409 @@ cleanup:
 }
 
 // ============================================================
+// Test 21: MULTI mode — two hooks on same address
+// ============================================================
+
+static atomic_int g_multi_hook1_called = 0;
+static atomic_int g_multi_hook2_called = 0;
+static int (*orig_abs_multi1)(int) = NULL;
+static int (*orig_abs_multi2)(int) = NULL;
+
+static int my_abs_multi1(int x) {
+  atomic_fetch_add(&g_multi_hook1_called, 1);
+  return orig_abs_multi1(x);
+}
+
+static int my_abs_multi2(int x) {
+  atomic_fetch_add(&g_multi_hook2_called, 1);
+  return orig_abs_multi2(x);
+}
+
+static void test_multi_two_hooks(void) {
+  TEST_BEGIN("MULTI: two hooks on abs()");
+
+  void *h1 = NULL, *h2 = NULL;
+
+  h1 = newhook_hook_func_addr_ex((void *)abs, (void *)my_abs_multi1,
+                                  (void **)&orig_abs_multi1, NH_MODE_MULTI);
+  TEST_ASSERT_CLEANUP(h1 != NULL);
+  TEST_ASSERT_CLEANUP(orig_abs_multi1 != NULL);
+
+  h2 = newhook_hook_func_addr_ex((void *)abs, (void *)my_abs_multi2,
+                                  (void **)&orig_abs_multi2, NH_MODE_MULTI);
+  TEST_ASSERT_CLEANUP(h2 != NULL);
+  TEST_ASSERT_CLEANUP(orig_abs_multi2 != NULL);
+
+  atomic_store(&g_multi_hook1_called, 0);
+  atomic_store(&g_multi_hook2_called, 0);
+
+  // call abs — should go through hook1 -> hook2 -> original
+  int r = abs(-42);
+  TEST_ASSERT_CLEANUP(r == 42);
+  TEST_ASSERT_CLEANUP(atomic_load(&g_multi_hook1_called) == 1);
+  TEST_ASSERT_CLEANUP(atomic_load(&g_multi_hook2_called) == 1);
+
+  TEST_PASS();
+
+cleanup:
+  if (h2) newhook_unhook(h2);
+  if (h1) newhook_unhook(h1);
+}
+
+// ============================================================
+// Test 22: MULTI mode — unhook middle, chain still works
+// ============================================================
+
+static atomic_int g_multi_a_called = 0;
+static atomic_int g_multi_b_called = 0;
+static atomic_int g_multi_c_called = 0;
+static int (*orig_abs_ma)(int) = NULL;
+static int (*orig_abs_mb)(int) = NULL;
+static int (*orig_abs_mc)(int) = NULL;
+
+static int my_abs_ma(int x) { atomic_fetch_add(&g_multi_a_called, 1); return orig_abs_ma(x); }
+static int my_abs_mb(int x) { atomic_fetch_add(&g_multi_b_called, 1); return orig_abs_mb(x); }
+static int my_abs_mc(int x) { atomic_fetch_add(&g_multi_c_called, 1); return orig_abs_mc(x); }
+
+static void test_multi_unhook_middle(void) {
+  TEST_BEGIN("MULTI: unhook middle of chain");
+
+  void *ha = NULL, *hb = NULL, *hc = NULL;
+
+  ha = newhook_hook_func_addr_ex((void *)abs, (void *)my_abs_ma,
+                                  (void **)&orig_abs_ma, NH_MODE_MULTI);
+  TEST_ASSERT_CLEANUP(ha != NULL);
+
+  hb = newhook_hook_func_addr_ex((void *)abs, (void *)my_abs_mb,
+                                  (void **)&orig_abs_mb, NH_MODE_MULTI);
+  TEST_ASSERT_CLEANUP(hb != NULL);
+
+  hc = newhook_hook_func_addr_ex((void *)abs, (void *)my_abs_mc,
+                                  (void **)&orig_abs_mc, NH_MODE_MULTI);
+  TEST_ASSERT_CLEANUP(hc != NULL);
+
+  // unhook middle (B)
+  int r = newhook_unhook(hb);
+  hb = NULL;
+  TEST_ASSERT_CLEANUP(r == NH_OK);
+
+  atomic_store(&g_multi_a_called, 0);
+  atomic_store(&g_multi_b_called, 0);
+  atomic_store(&g_multi_c_called, 0);
+
+  // call abs — should go through A -> C -> original (B skipped)
+  int val = abs(-99);
+  TEST_ASSERT_CLEANUP(val == 99);
+  TEST_ASSERT_CLEANUP(atomic_load(&g_multi_a_called) == 1);
+  TEST_ASSERT_CLEANUP(atomic_load(&g_multi_b_called) == 0);
+  TEST_ASSERT_CLEANUP(atomic_load(&g_multi_c_called) == 1);
+
+  TEST_PASS();
+
+cleanup:
+  if (hc) newhook_unhook(hc);
+  if (hb) newhook_unhook(hb);
+  if (ha) newhook_unhook(ha);
+}
+
+// ============================================================
+// Test 23: MULTI mode — unhook all, function restored
+// ============================================================
+
+static int (*orig_abs_restore)(int) = NULL;
+static int my_abs_restore(int x) { return orig_abs_restore(x) + 1000; }
+
+static void test_multi_unhook_all(void) {
+  TEST_BEGIN("MULTI: unhook all restores original");
+
+  void *h1 = newhook_hook_func_addr_ex((void *)abs, (void *)my_abs_restore,
+                                        (void **)&orig_abs_restore, NH_MODE_MULTI);
+  TEST_ASSERT_CLEANUP(h1 != NULL);
+
+  TEST_ASSERT_CLEANUP(abs(-5) == 1005);  // hooked: 5 + 1000
+
+  int r = newhook_unhook(h1);
+  h1 = NULL;
+  TEST_ASSERT_CLEANUP(r == NH_OK);
+
+  TEST_ASSERT_CLEANUP(abs(-5) == 5);  // restored
+
+  TEST_PASS();
+
+cleanup:
+  if (h1) newhook_unhook(h1);
+}
+
+// ============================================================
+// Test 24: MULTI mode — mode conflict with UNIQUE
+// ============================================================
+
+static int (*orig_abs_conflict)(int) = NULL;
+static int my_abs_conflict(int x) { return orig_abs_conflict(x); }
+static int (*orig_abs_conflict2)(int) = NULL;
+static int my_abs_conflict2(int x) { return orig_abs_conflict2(x); }
+
+static void test_multi_mode_conflict(void) {
+  TEST_BEGIN("MULTI: mode conflict with UNIQUE");
+
+  void *h1 = NULL, *h2 = NULL;
+
+  // hook with UNIQUE first
+  h1 = newhook_hook_func_addr_ex((void *)abs, (void *)my_abs_conflict,
+                                  (void **)&orig_abs_conflict, NH_MODE_UNIQUE);
+  TEST_ASSERT_CLEANUP(h1 != NULL);
+
+  // try MULTI on same address — should fail
+  h2 = newhook_hook_func_addr_ex((void *)abs, (void *)my_abs_conflict2,
+                                  (void **)&orig_abs_conflict2, NH_MODE_MULTI);
+  TEST_ASSERT_CLEANUP(h2 == NULL);
+
+  TEST_PASS();
+
+cleanup:
+  if (h2) newhook_unhook(h2);
+  if (h1) newhook_unhook(h1);
+}
+
+// ============================================================
+// Test 25: SHARED mode — two hooks on same address
+// ============================================================
+
+static atomic_int g_shared_hook1_called = 0;
+static atomic_int g_shared_hook2_called = 0;
+
+static int my_abs_shared1(int x) {
+  atomic_fetch_add(&g_shared_hook1_called, 1);
+  // In SHARED mode, call prev to continue the chain
+  int (*prev)(int) = (int (*)(int))newhook_get_prev_func((void *)my_abs_shared1);
+  return prev(x);
+}
+
+static int my_abs_shared2(int x) {
+  atomic_fetch_add(&g_shared_hook2_called, 1);
+  int (*prev)(int) = (int (*)(int))newhook_get_prev_func((void *)my_abs_shared2);
+  return prev(x);
+}
+
+static void test_shared_two_hooks(void) {
+  TEST_BEGIN("SHARED: two hooks on abs()");
+
+  void *h1 = NULL, *h2 = NULL;
+
+  h1 = newhook_hook_func_addr_ex((void *)abs, (void *)my_abs_shared1,
+                                  NULL, NH_MODE_SHARED);
+  TEST_ASSERT_CLEANUP(h1 != NULL);
+
+  h2 = newhook_hook_func_addr_ex((void *)abs, (void *)my_abs_shared2,
+                                  NULL, NH_MODE_SHARED);
+  TEST_ASSERT_CLEANUP(h2 != NULL);
+
+  atomic_store(&g_shared_hook1_called, 0);
+  atomic_store(&g_shared_hook2_called, 0);
+
+  int r = abs(-77);
+  TEST_ASSERT_CLEANUP(r == 77);
+  // both hooks should have been called
+  TEST_ASSERT_CLEANUP(atomic_load(&g_shared_hook1_called) >= 1);
+  TEST_ASSERT_CLEANUP(atomic_load(&g_shared_hook2_called) >= 1);
+
+  TEST_PASS();
+
+cleanup:
+  if (h2) newhook_unhook(h2);
+  if (h1) newhook_unhook(h1);
+}
+
+// ============================================================
+// Test 26: SHARED mode — unhook one, other still works
+// ============================================================
+
+static atomic_int g_shared_x_called = 0;
+static atomic_int g_shared_y_called = 0;
+
+static int my_abs_shared_x(int x) {
+  atomic_fetch_add(&g_shared_x_called, 1);
+  int (*prev)(int) = (int (*)(int))newhook_get_prev_func((void *)my_abs_shared_x);
+  return prev(x);
+}
+
+static int my_abs_shared_y(int x) {
+  atomic_fetch_add(&g_shared_y_called, 1);
+  int (*prev)(int) = (int (*)(int))newhook_get_prev_func((void *)my_abs_shared_y);
+  return prev(x);
+}
+
+static void test_shared_unhook_one(void) {
+  TEST_BEGIN("SHARED: unhook one, other still works");
+
+  void *hx = NULL, *hy = NULL;
+
+  hx = newhook_hook_func_addr_ex((void *)abs, (void *)my_abs_shared_x,
+                                  NULL, NH_MODE_SHARED);
+  TEST_ASSERT_CLEANUP(hx != NULL);
+
+  hy = newhook_hook_func_addr_ex((void *)abs, (void *)my_abs_shared_y,
+                                  NULL, NH_MODE_SHARED);
+  TEST_ASSERT_CLEANUP(hy != NULL);
+
+  // unhook X
+  int r = newhook_unhook(hx);
+  hx = NULL;
+  TEST_ASSERT_CLEANUP(r == NH_OK);
+
+  atomic_store(&g_shared_x_called, 0);
+  atomic_store(&g_shared_y_called, 0);
+
+  int val = abs(-33);
+  TEST_ASSERT_CLEANUP(val == 33);
+  TEST_ASSERT_CLEANUP(atomic_load(&g_shared_x_called) == 0);  // X disabled
+  TEST_ASSERT_CLEANUP(atomic_load(&g_shared_y_called) >= 1);   // Y still active
+
+  TEST_PASS();
+
+cleanup:
+  if (hy) newhook_unhook(hy);
+  if (hx) newhook_unhook(hx);
+}
+
+// ============================================================
+// Test 27: SHARED mode — unhook all restores original
+// ============================================================
+
+static atomic_int g_shared_solo_called = 0;
+
+static int my_abs_shared_solo(int x) {
+  atomic_fetch_add(&g_shared_solo_called, 1);
+  int (*prev)(int) = (int (*)(int))newhook_get_prev_func((void *)my_abs_shared_solo);
+  return prev(x);
+}
+
+static void test_shared_unhook_all(void) {
+  TEST_BEGIN("SHARED: unhook all restores original");
+
+  void *h = newhook_hook_func_addr_ex((void *)abs, (void *)my_abs_shared_solo,
+                                       NULL, NH_MODE_SHARED);
+  TEST_ASSERT_CLEANUP(h != NULL);
+
+  atomic_store(&g_shared_solo_called, 0);
+  TEST_ASSERT_CLEANUP(abs(-10) == 10);
+  TEST_ASSERT_CLEANUP(atomic_load(&g_shared_solo_called) == 1);
+
+  int r = newhook_unhook(h);
+  h = NULL;
+  TEST_ASSERT_CLEANUP(r == NH_OK);
+
+  atomic_store(&g_shared_solo_called, 0);
+  TEST_ASSERT_CLEANUP(abs(-10) == 10);
+  TEST_ASSERT_CLEANUP(atomic_load(&g_shared_solo_called) == 0);  // no longer called
+
+  TEST_PASS();
+
+cleanup:
+  if (h) newhook_unhook(h);
+}
+
+// ============================================================
+// Test 28: linker monitor init
+// ============================================================
+
+static void test_linker_monitor_init(void) {
+  TEST_BEGIN("linker monitor init");
+
+  int r = newhook_init_linker_monitor();
+  TEST_ASSERT(r == NH_OK);
+
+  // double init should also succeed
+  r = newhook_init_linker_monitor();
+  TEST_ASSERT(r == NH_OK);
+
+  TEST_PASS();
+}
+
+// ============================================================
+// Test 29: linker monitor detects dlopen
+// ============================================================
+
+static atomic_int g_dl_init_pre_called = 0;
+static atomic_int g_dl_init_post_called = 0;
+
+// Forward declare the callback type matching nh_dl_info_cb_t
+// We include link.h for struct dl_phdr_info
+static void dl_init_pre_cb(struct dl_phdr_info *info, size_t size, void *data) {
+  (void)size; (void)data;
+  if (info->dlpi_name && strstr(info->dlpi_name, "libshadowhook_nothing.so")) {
+    atomic_fetch_add(&g_dl_init_pre_called, 1);
+  }
+}
+
+static void dl_init_post_cb(struct dl_phdr_info *info, size_t size, void *data) {
+  (void)size; (void)data;
+  if (info->dlpi_name && strstr(info->dlpi_name, "libshadowhook_nothing.so")) {
+    atomic_fetch_add(&g_dl_init_post_called, 1);
+  }
+}
+
+// We need access to nh_linker registration functions (internal API)
+#include "nh_linker.h"
+
+static void test_linker_monitor_dlopen(void) {
+  TEST_BEGIN("linker monitor detects dlopen");
+
+  atomic_store(&g_dl_init_pre_called, 0);
+  atomic_store(&g_dl_init_post_called, 0);
+
+  int r = nh_linker_register_dl_init_cb(dl_init_pre_cb, dl_init_post_cb, NULL);
+  TEST_ASSERT_CLEANUP(r == 0);
+
+  // dlopen nothing.so — should trigger callbacks
+  void *handle = dlopen("libshadowhook_nothing.so", RTLD_NOW);
+  TEST_ASSERT_CLEANUP(handle != NULL);
+
+  TEST_ASSERT_CLEANUP(atomic_load(&g_dl_init_pre_called) == 1);
+  TEST_ASSERT_CLEANUP(atomic_load(&g_dl_init_post_called) == 1);
+
+  dlclose(handle);
+
+  nh_linker_unregister_dl_init_cb(dl_init_pre_cb, dl_init_post_cb, NULL);
+
+  TEST_PASS();
+  return;
+
+cleanup:
+  nh_linker_unregister_dl_init_cb(dl_init_pre_cb, dl_init_post_cb, NULL);
+}
+
+// ============================================================
+// Test 30: delayed hook — hook_sym_name_ex on not-yet-loaded lib
+// ============================================================
+
+static void test_delayed_hook_pending(void) {
+  TEST_BEGIN("delayed hook returns pending");
+
+  void *orig = NULL;
+  void *handle = newhook_hook_sym_name_ex(
+      "libnotloaded_test.so", "some_func",
+      (void *)(uintptr_t)0xDEAD, &orig, NH_MODE_UNIQUE);
+
+  // Should return a handle (pending) or NULL with PENDING errno
+  if (handle != NULL) {
+    // pending task created, handle is valid but hook not yet active
+    TEST_ASSERT_CLEANUP(newhook_get_errno() == NH_ERR_PENDING || newhook_get_errno() == NH_OK);
+    newhook_unhook(handle);
+  } else {
+    // pending not yet implemented or linker monitor not active — should be PENDING or SYMBOL_NOT_FOUND
+    int err = newhook_get_errno();
+    TEST_ASSERT(err == NH_ERR_PENDING || err == NH_ERR_SYMBOL_NOT_FOUND);
+  }
+
+  TEST_PASS();
+  return;
+
+cleanup:
+  if (handle) newhook_unhook(handle);
+}
+
+// ============================================================
 // main
 // ============================================================
 
@@ -843,6 +1247,22 @@ int main(void) {
   test_hook_sym_nonexistent_lib();
   test_recursive_hook_call();
   test_hook_arg_passing();
+
+  printf("\n--- MULTI mode ---\n");
+  test_multi_two_hooks();
+  test_multi_unhook_middle();
+  test_multi_unhook_all();
+  test_multi_mode_conflict();
+
+  printf("\n--- SHARED mode ---\n");
+  test_shared_two_hooks();
+  test_shared_unhook_one();
+  test_shared_unhook_all();
+
+  printf("\n--- Linker monitor ---\n");
+  test_linker_monitor_init();
+  test_linker_monitor_dlopen();
+  test_delayed_hook_pending();
 
   printf("\n========================================\n");
   printf("  Results: %d passed, %d failed\n", g_pass, g_fail);

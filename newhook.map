@@ -6,6 +6,12 @@ NEWHOOK_1.0 {
     newhook_unhook;
     newhook_get_errno;
     newhook_strerror;
+    newhook_hook_func_addr_ex;
+    newhook_hook_sym_name_ex;
+    newhook_init_linker_monitor;
+    newhook_get_prev_func;
+    newhook_pop_stack;
+    newhook_get_return_address;
   local:
     *;
 };

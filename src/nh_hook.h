@@ -18,6 +18,7 @@ typedef struct {
   uintptr_t island_exit;                    // island: target → new_func
   bool      with_island;                    // strategy A or B
   bool      hooked;                         // currently active
+  bool      has_landing_pad;                // target[0] was BTI/PACIASP landing pad
 } nh_hook_t;
 
 // Install a hook at target_addr, redirecting to new_func.

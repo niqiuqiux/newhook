@@ -1,8 +1,33 @@
 #ifndef NH_A64_H
 #define NH_A64_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+
+// ── BTI / PAC instruction constants ──
+#define NH_A64_INST_BTI_C    0xD503245F  // HINT #34 — landing pad for BLR (indirect call)
+#define NH_A64_INST_BTI_J    0xD503249F  // HINT #36 — landing pad for BR (indirect jump)
+#define NH_A64_INST_BTI_JC   0xD50324DF  // HINT #38 — landing pad for both BR and BLR
+#define NH_A64_INST_PACIASP  0xD503233F  // HINT #25 — sign LR with A-key + SP (also BTI c)
+#define NH_A64_INST_PACIBSP  0xD503237F  // HINT #27 — sign LR with B-key + SP (also BTI c)
+
+// Check if an instruction is a BTI hint (BTI c / BTI j / BTI jc).
+static inline bool nh_a64_is_bti(uint32_t inst) {
+  return inst == NH_A64_INST_BTI_C ||
+         inst == NH_A64_INST_BTI_J ||
+         inst == NH_A64_INST_BTI_JC;
+}
+
+// Check if an instruction is PACIASP or PACIBSP (PAC sign LR, also valid BTI landing pad).
+static inline bool nh_a64_is_pac_sp(uint32_t inst) {
+  return inst == NH_A64_INST_PACIASP || inst == NH_A64_INST_PACIBSP;
+}
+
+// Check if an instruction is any valid BTI landing pad (BTI hint or PAC SP variant).
+static inline bool nh_a64_is_landing_pad(uint32_t inst) {
+  return nh_a64_is_bti(inst) || nh_a64_is_pac_sp(inst);
+}
 
 // ARM64 instruction types (PC-relative)
 typedef enum {

@@ -37,19 +37,29 @@ void nh_util_flush_cache(uintptr_t addr, size_t len) {
 
 void nh_util_write_inst(uintptr_t addr, const void *data, size_t len) {
   // ARM64 guarantees atomic aligned 4-byte and 8-byte stores.
-  // For 16-byte writes, we write the data portion first (bytes 8-15),
-  // then the instruction portion (bytes 0-7) which activates the hook.
+  // For multi-word writes, we write data/tail portions first, then the
+  // instruction portion last to activate the hook atomically.
   if (len == 4) {
     __atomic_store_n((uint32_t *)addr, *(const uint32_t *)data, __ATOMIC_SEQ_CST);
   } else if (len == 8) {
-    __atomic_store_n((uint64_t *)addr, *(const uint64_t *)data, __ATOMIC_SEQ_CST);
+    // Write bytes [4-7] first, then [0-3] to activate
+    __atomic_store_n((uint32_t *)(addr + 4), *((const uint32_t *)data + 1), __ATOMIC_SEQ_CST);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    __atomic_store_n((uint32_t *)addr, *(const uint32_t *)data, __ATOMIC_SEQ_CST);
   } else if (len == 16) {
-    // Write address data first (harmless if partially read by other threads)
+    // Write address data first (bytes 8-15, harmless if partially read)
     __atomic_store_n((uint64_t *)(addr + 8), *((const uint64_t *)data + 1), __ATOMIC_SEQ_CST);
-    // Memory barrier
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     // Write instruction pair (LDR + BR) last to activate the hook
     __atomic_store_n((uint64_t *)addr, *(const uint64_t *)data, __ATOMIC_SEQ_CST);
+  } else if (len == 20) {
+    // BTI-aware 20-byte write: BTI c + LDR X17 + BR X17 + .quad addr
+    // Write order: .quad (bytes 12-19) → LDR+BR (bytes 4-11) → BTI c (byte 0-3)
+    __atomic_store_n((uint64_t *)(addr + 12), *((const uint64_t *)((const uint8_t *)data + 12)), __ATOMIC_SEQ_CST);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    __atomic_store_n((uint64_t *)(addr + 4), *((const uint64_t *)((const uint8_t *)data + 4)), __ATOMIC_SEQ_CST);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    __atomic_store_n((uint32_t *)addr, *(const uint32_t *)data, __ATOMIC_SEQ_CST);
   } else {
     // Fallback: byte-by-byte copy (shouldn't happen in normal use)
     memcpy((void *)addr, data, len);

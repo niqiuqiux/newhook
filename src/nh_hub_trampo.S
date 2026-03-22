@@ -18,6 +18,11 @@
 .type nh_hub_trampo_template, %function
 nh_hub_trampo_template:
 
+    // BTI landing pad — allows indirect branches (BR/BLR) to this address.
+    // Currently MAP_ANONYMOUS pages don't enforce BTI, but this is defensive
+    // in case future kernels change that policy.
+    hint    #34                     // BTI c
+
     // Save parameter registers (x0-x7), XR(x8), LR, and SIMD registers (q0-q7)
     stp   x0, x1, [sp, #-0xd0]!    // pre-decrement sp by 0xd0, save x0-x1
     stp   x2, x3, [sp, #0x10]

@@ -73,30 +73,41 @@ static int build_enter(uintptr_t enter, uintptr_t target_addr,
 }
 
 // ============================================================
-// Strategy A: hook with island (4-byte backup)
+// Strategy A: hook with island
+// Without landing pad: 4-byte backup (1 instruction)
+// With landing pad:    8-byte backup (2 instructions)
 // ============================================================
 
 static int hook_with_island(nh_hook_t *hook, void **orig_func) {
   uintptr_t target = hook->target_addr;
   uintptr_t new_func = hook->new_func;
 
+  // Detect BTI/PAC landing pad at target[0]
+  uint32_t first_inst = *((uint32_t *)target);
+  bool has_lp = nh_a64_is_landing_pad(first_inst);
+  hook->has_landing_pad = has_lp;
+
+  // B instruction PC and backup length depend on landing pad presence
+  uintptr_t b_pc = has_lp ? target + 4 : target;
+  size_t backup_len = has_lp ? (BACKUP_LEN_ISLAND + 4) : BACKUP_LEN_ISLAND;
+
   // 1. Allocate enter trampoline (64 bytes)
   uintptr_t enter = nh_enter_alloc(true);
   if (enter == 0) return NH_ERR_ALLOC_ENTER;
 
-  // 2. Allocate island_exit near target (within ±128MB for B instruction)
-  uintptr_t island_exit = nh_island_alloc(target, NH_A64_B_RANGE - 4);
+  // 2. Allocate island_exit near B instruction PC (within ±128MB)
+  uintptr_t island_exit = nh_island_alloc(b_pc, NH_A64_B_RANGE - 4);
   if (island_exit == 0) {
     nh_enter_free(enter, true);
     return NH_ERR_ALLOC_ISLAND;
   }
 
-  // 3. Backup 1 instruction (4 bytes)
-  hook->backup[0] = *((uint32_t *)target);
-  hook->backup_len = BACKUP_LEN_ISLAND;
+  // 3. Backup instructions
+  memcpy(hook->backup, (void *)target, backup_len);
+  hook->backup_len = backup_len;
 
-  // 4. Build enter trampoline
-  int r = build_enter(enter, target, hook->backup, BACKUP_LEN_ISLAND,
+  // 4. Build enter trampoline (includes PACIASP if original had it)
+  int r = build_enter(enter, target, hook->backup, backup_len,
                       NH_ENTER_WITH_ISLAND_SIZE);
   if (r != NH_OK) {
     nh_island_free(island_exit);
@@ -108,8 +119,8 @@ static int hook_with_island(nh_hook_t *hook, void **orig_func) {
   nh_a64_make_abs_jump((uint32_t *)island_exit, new_func);
   nh_util_flush_cache(island_exit, NH_A64_ABS_JUMP_LEN);
 
-  // 6. Patch target: B <island_exit>
-  int64_t b_offset = (int64_t)island_exit - (int64_t)target;
+  // 6. Verify B range from b_pc to island_exit
+  int64_t b_offset = (int64_t)island_exit - (int64_t)b_pc;
   if (b_offset < -(int64_t)NH_A64_B_RANGE || b_offset >= (int64_t)NH_A64_B_RANGE) {
     NH_LOG_E("hook: island_exit out of B range");
     nh_island_free(island_exit);
@@ -118,40 +129,50 @@ static int hook_with_island(nh_hook_t *hook, void **orig_func) {
   }
 
   // Make target page writable
-  if (nh_util_mprotect(target, 4, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+  if (nh_util_mprotect(target, backup_len, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
     nh_island_free(island_exit);
     nh_enter_free(enter, true);
     return NH_ERR_MPROTECT;
   }
 
   // CRITICAL: Set orig_func BEFORE the patch takes effect.
-  // Once we write the B instruction, the hook is live and the callback
-  // may be invoked (e.g., if log functions internally call the hooked function).
   hook->enter = enter;
   hook->island_exit = island_exit;
   hook->with_island = true;
   if (orig_func != NULL) *orig_func = (void *)enter;
 
-  uint32_t b_inst;
-  nh_a64_make_rel_jump(&b_inst, target, island_exit);
+  // Build the patch buffer
+  uint32_t patch[2];
+  size_t patch_len;
+  if (has_lp) {
+    // [0] BTI c (replace PACIASP to avoid double-signing; keep BTI as-is)
+    patch[0] = nh_a64_is_pac_sp(first_inst) ? NH_A64_INST_BTI_C : first_inst;
+    // [1] B <island_exit>
+    nh_a64_make_rel_jump(&patch[1], b_pc, island_exit);
+    patch_len = 8;
+  } else {
+    nh_a64_make_rel_jump(&patch[0], target, island_exit);
+    patch_len = 4;
+  }
 
-  // Atomic 4-byte write with signal protection
+  // Atomic write with signal protection
   bool write_ok = true;
   NH_SAFE_TRY() {
-    nh_util_write_inst(target, &b_inst, 4);
+    nh_util_write_inst(target, patch, patch_len);
   }
   NH_SAFE_CATCH() {
     write_ok = false;
   }
   NH_SAFE_END;
 
-  nh_util_flush_cache(target, 4);
-  nh_util_mprotect(target, 4, PROT_READ | PROT_EXEC);
+  nh_util_flush_cache(target, patch_len);
+  nh_util_mprotect(target, backup_len, PROT_READ | PROT_EXEC);
 
   if (!write_ok) {
     hook->enter = 0;
     hook->island_exit = 0;
     hook->with_island = false;
+    hook->has_landing_pad = false;
     if (orig_func != NULL) *orig_func = NULL;
     nh_island_free(island_exit);
     nh_enter_free(enter, true);
@@ -160,22 +181,32 @@ static int hook_with_island(nh_hook_t *hook, void **orig_func) {
 
   hook->hooked = true;
 
-  NH_LOG_I("hook: installed (island) target=%p, new=%p, enter=%p, island=%p",
-           (void *)target, (void *)new_func, (void *)enter, (void *)island_exit);
+  NH_LOG_I("hook: installed (island%s) target=%p, new=%p, enter=%p, island=%p",
+           has_lp ? "+bti" : "", (void *)target, (void *)new_func,
+           (void *)enter, (void *)island_exit);
   return NH_OK;
 }
 
 // ============================================================
-// Strategy B: hook without island (16-byte backup)
+// Strategy B: hook without island
+// Without landing pad: 16-byte backup (4 instructions)
+// With landing pad:    20-byte backup (5 instructions)
 // ============================================================
 
 static int hook_without_island(nh_hook_t *hook, size_t sym_size, void **orig_func) {
   uintptr_t target = hook->target_addr;
   uintptr_t new_func = hook->new_func;
 
-  // Check that the function is large enough for a 16-byte patch
-  if (sym_size != 0 && sym_size < BACKUP_LEN_NO_ISLAND) {
-    NH_LOG_E("hook: function too small (%zu < %d)", sym_size, BACKUP_LEN_NO_ISLAND);
+  // Detect BTI/PAC landing pad (may already be set by Strategy A attempt)
+  uint32_t first_inst = *((uint32_t *)target);
+  bool has_lp = nh_a64_is_landing_pad(first_inst);
+  hook->has_landing_pad = has_lp;
+
+  size_t backup_len = has_lp ? (BACKUP_LEN_NO_ISLAND + 4) : BACKUP_LEN_NO_ISLAND;
+
+  // Check that the function is large enough for the patch
+  if (sym_size != 0 && sym_size < backup_len) {
+    NH_LOG_E("hook: function too small (%zu < %zu)", sym_size, backup_len);
     return NH_ERR_FUNC_TOO_SMALL;
   }
 
@@ -183,24 +214,32 @@ static int hook_without_island(nh_hook_t *hook, size_t sym_size, void **orig_fun
   uintptr_t enter = nh_enter_alloc(false);
   if (enter == 0) return NH_ERR_ALLOC_ENTER;
 
-  // 2. Backup 4 instructions (16 bytes)
-  memcpy(hook->backup, (void *)target, BACKUP_LEN_NO_ISLAND);
-  hook->backup_len = BACKUP_LEN_NO_ISLAND;
+  // 2. Backup instructions
+  memcpy(hook->backup, (void *)target, backup_len);
+  hook->backup_len = backup_len;
 
-  // 3. Build enter trampoline
-  int r = build_enter(enter, target, hook->backup, BACKUP_LEN_NO_ISLAND,
+  // 3. Build enter trampoline (includes PACIASP if original had it)
+  int r = build_enter(enter, target, hook->backup, backup_len,
                       NH_ENTER_WITHOUT_ISLAND_SIZE);
   if (r != NH_OK) {
     nh_enter_free(enter, false);
     return r;
   }
 
-  // 4. Build the 16-byte patch: LDR X17, [PC, #8]; BR X17; .quad new_func
-  uint32_t patch[4];
-  nh_a64_make_abs_jump(patch, new_func);
+  // 4. Build the patch
+  // With LP:    BTI c + LDR X17 + BR X17 + .quad = 20 bytes
+  // Without LP: LDR X17 + BR X17 + .quad           = 16 bytes
+  uint32_t patch[5];
+  size_t patch_offset = 0;
+  if (has_lp) {
+    patch[0] = nh_a64_is_pac_sp(first_inst) ? NH_A64_INST_BTI_C : first_inst;
+    patch_offset = 1;
+  }
+  nh_a64_make_abs_jump(patch + patch_offset, new_func);
+  size_t patch_len = backup_len;
 
   // 5. Patch target
-  if (nh_util_mprotect(target, BACKUP_LEN_NO_ISLAND, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+  if (nh_util_mprotect(target, backup_len, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
     nh_enter_free(enter, false);
     return NH_ERR_MPROTECT;
   }
@@ -213,18 +252,19 @@ static int hook_without_island(nh_hook_t *hook, size_t sym_size, void **orig_fun
 
   bool write_ok = true;
   NH_SAFE_TRY() {
-    nh_util_write_inst(target, patch, 16);
+    nh_util_write_inst(target, patch, patch_len);
   }
   NH_SAFE_CATCH() {
     write_ok = false;
   }
   NH_SAFE_END;
 
-  nh_util_flush_cache(target, BACKUP_LEN_NO_ISLAND);
-  nh_util_mprotect(target, BACKUP_LEN_NO_ISLAND, PROT_READ | PROT_EXEC);
+  nh_util_flush_cache(target, backup_len);
+  nh_util_mprotect(target, backup_len, PROT_READ | PROT_EXEC);
 
   if (!write_ok) {
     hook->enter = 0;
+    hook->has_landing_pad = false;
     if (orig_func != NULL) *orig_func = NULL;
     nh_enter_free(enter, false);
     return NH_ERR_PATCH;
@@ -232,8 +272,8 @@ static int hook_without_island(nh_hook_t *hook, size_t sym_size, void **orig_fun
 
   hook->hooked = true;
 
-  NH_LOG_I("hook: installed (no-island) target=%p, new=%p, enter=%p",
-           (void *)target, (void *)new_func, (void *)enter);
+  NH_LOG_I("hook: installed (no-island%s) target=%p, new=%p, enter=%p",
+           has_lp ? "+bti" : "", (void *)target, (void *)new_func, (void *)enter);
   return NH_OK;
 }
 
@@ -301,14 +341,16 @@ int nh_hook_uninstall(nh_hook_t *hook) {
 int nh_hook_update_new_func(nh_hook_t *hook, uintptr_t new_func) {
   if (!hook->hooked) return NH_ERR_NOT_HOOKED;
 
-  // The .quad address is always at offset +8 from the jump sequence start.
-  // Strategy A (island): island_exit = LDR X17,[PC,#8]; BR X17; .quad addr
-  // Strategy B (no-island): target = LDR X17,[PC,#8]; BR X17; .quad addr
+  // The .quad address is at offset +8 from the LDR X17,[PC,#8] instruction.
+  // Strategy A (island): island_exit+0 = LDR; +4 = BR; +8 = .quad
+  // Strategy B (no-island): the LDR starts at target+0 or target+4 (if landing pad)
   uintptr_t addr_loc;
   if (hook->with_island) {
     addr_loc = hook->island_exit + 8;
   } else {
-    addr_loc = hook->target_addr + 8;
+    // LDR X17 is at target+0 normally, or target+4 if BTI c occupies target+0
+    uintptr_t ldr_pc = hook->target_addr + (hook->has_landing_pad ? 4 : 0);
+    addr_loc = ldr_pc + 8;
   }
 
   // Atomic 8-byte write to update the target address

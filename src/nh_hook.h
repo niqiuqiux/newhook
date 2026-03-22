@@ -32,4 +32,9 @@ int nh_hook_install(nh_hook_t *hook, uintptr_t target_addr, uintptr_t new_func,
 // Remove a previously installed hook, restoring original instructions.
 int nh_hook_uninstall(nh_hook_t *hook);
 
+// Atomically update where the hook redirects to (without uninstall/reinstall).
+// Only updates the .quad address in the jump sequence.
+// Returns NH_OK on success.
+int nh_hook_update_new_func(nh_hook_t *hook, uintptr_t new_func);
+
 #endif // NH_HOOK_H

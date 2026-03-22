@@ -140,22 +140,23 @@ uintptr_t nh_hub_push_stack_impl(nh_hub_t *hub, void *return_address) {
     }
   }
 
+  // snapshot proxy list once for consistency
+  nh_hub_proxy_t *proxies_snap = __atomic_load_n(&hub->proxies, __ATOMIC_ACQUIRE);
+
   // find first enabled proxy
   nh_hub_proxy_t *first = NULL;
-  nh_hub_proxy_t *p = __atomic_load_n(&hub->proxies, __ATOMIC_ACQUIRE);
-  while (p) {
+  for (nh_hub_proxy_t *p = proxies_snap; p; p = p->next) {
     if (__atomic_load_n(&p->enabled, __ATOMIC_ACQUIRE)) {
       first = p;
       break;
     }
-    p = p->next;
   }
 
   if (!first) return hub->orig_addr;
 
-  // push frame
+  // push frame using the same snapshot
   nh_hub_frame_t *frame = &stack->frames[stack->frames_cnt++];
-  frame->proxies = __atomic_load_n(&hub->proxies, __ATOMIC_ACQUIRE);
+  frame->proxies = proxies_snap;
   frame->orig_addr = hub->orig_addr;
   frame->return_address = return_address;
 

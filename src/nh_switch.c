@@ -119,15 +119,16 @@ static nh_switch_t *find_switch(uintptr_t target_addr) {
 // ============================================================================
 
 static nh_switch_t *create_switch(uintptr_t target_addr, uintptr_t new_func,
-                                  void **orig_func, size_t sym_size) {
+                                  void **orig_func, size_t sym_size, int *out_err) {
   nh_switch_t *sw = calloc(1, sizeof(nh_switch_t));
-  if (!sw) return NULL;
+  if (!sw) { if (out_err) *out_err = NH_ERR_OOM; return NULL; }
 
   sw->target_addr = target_addr;
   sw->hook_mode = NH_SWITCH_MODE_NONE;
 
   int r = nh_hook_install(&sw->inst, target_addr, new_func, orig_func, sym_size);
   if (r != NH_OK) {
+    if (out_err) *out_err = r;
     free(sw);
     return NULL;
   }
@@ -170,16 +171,17 @@ static void destroy_switch(nh_switch_t *sw) {
 // ============================================================================
 
 static nh_switch_handle_t *hook_unique(uintptr_t target_addr, uintptr_t new_func,
-                                       void **orig_func, size_t sym_size) {
+                                       void **orig_func, size_t sym_size,
+                                       int *out_err) {
   nh_switch_t *sw = find_switch(target_addr);
 
   if (sw != NULL) {
-    // address already hooked
-    if (sw->hook_mode == NH_SWITCH_MODE_UNIQUE) return NULL;  // NH_ERR_ALREADY_HOOKED
-    return NULL;  // NH_ERR_MODE_CONFLICT
+    if (out_err) *out_err = (sw->hook_mode == NH_SWITCH_MODE_UNIQUE)
+                            ? NH_ERR_ALREADY_HOOKED : NH_ERR_MODE_CONFLICT;
+    return NULL;
   }
 
-  sw = create_switch(target_addr, new_func, orig_func, sym_size);
+  sw = create_switch(target_addr, new_func, orig_func, sym_size, out_err);
   if (!sw) return NULL;
 
   sw->hook_mode = NH_SWITCH_MODE_UNIQUE;
@@ -188,6 +190,7 @@ static nh_switch_handle_t *hook_unique(uintptr_t target_addr, uintptr_t new_func
   nh_switch_handle_t *handle = calloc(1, sizeof(nh_switch_handle_t));
   if (!handle) {
     destroy_switch(sw);
+    if (out_err) *out_err = NH_ERR_OOM;
     return NULL;
   }
 
@@ -214,24 +217,28 @@ static int unhook_unique(nh_switch_handle_t *handle) {
 // ============================================================================
 
 static nh_switch_handle_t *hook_multi(uintptr_t target_addr, uintptr_t new_func,
-                                      void **orig_func, size_t sym_size) {
+                                      void **orig_func, size_t sym_size,
+                                      int *out_err) {
   nh_switch_t *sw = find_switch(target_addr);
 
   if (sw != NULL) {
     // mode conflict check
-    if (sw->hook_mode == NH_SWITCH_MODE_UNIQUE) return NULL;  // NH_ERR_MODE_CONFLICT
+    if (sw->hook_mode == NH_SWITCH_MODE_UNIQUE) {
+      if (out_err) *out_err = NH_ERR_MODE_CONFLICT;
+      return NULL;
+    }
   }
 
   // create proxy
   nh_multi_proxy_t *proxy = calloc(1, sizeof(nh_multi_proxy_t));
-  if (!proxy) return NULL;
+  if (!proxy) { if (out_err) *out_err = NH_ERR_OOM; return NULL; }
 
   proxy->new_addr = new_func;
   proxy->orig_addr = (uintptr_t *)orig_func;
 
   if (sw == NULL) {
     // first hook on this address
-    sw = create_switch(target_addr, new_func, orig_func, sym_size);
+    sw = create_switch(target_addr, new_func, orig_func, sym_size, out_err);
     if (!sw) { free(proxy); return NULL; }
 
     sw->hook_mode = NH_SWITCH_MODE_MULTI;
@@ -263,7 +270,31 @@ static nh_switch_handle_t *hook_multi(uintptr_t target_addr, uintptr_t new_func,
 
   nh_switch_handle_t *handle = calloc(1, sizeof(nh_switch_handle_t));
   if (!handle) {
-    // TODO: cleanup proxy from chain
+    // cleanup proxy from chain
+    nh_multi_proxy_t *prev = proxy->prev;
+    nh_multi_proxy_t *next = proxy->next;
+
+    if (prev) {
+      prev->next = next;
+      // restore prev's orig_addr to point to next or resume
+      uintptr_t target = next ? next->new_addr : sw->resume_addr;
+      __atomic_store_n(prev->orig_addr, target, __ATOMIC_RELEASE);
+    } else {
+      sw->proxies_head = next;
+    }
+    if (next) {
+      next->prev = prev;
+    } else {
+      sw->proxies_tail = prev;
+    }
+    free(proxy);
+
+    // if this was the only proxy, destroy the switch
+    if (!sw->proxies_head) {
+      sw->hook_mode = NH_SWITCH_MODE_NONE;
+      destroy_switch(sw);
+    }
+    if (out_err) *out_err = NH_ERR_OOM;
     return NULL;
   }
 
@@ -295,24 +326,12 @@ static int unhook_multi(nh_switch_handle_t *handle) {
     uintptr_t target = next ? next->new_addr : sw->resume_addr;
     __atomic_store_n(prev->orig_addr, target, __ATOMIC_RELEASE);
   } else {
-    // removing head
+    // removing head — atomically redirect to new head without uninstall/reinstall
     sw->proxies_head = next;
     if (next) {
-      // need to rehook instruction to point to new head
-      // For simplicity, we uninstall and reinstall
-      nh_hook_uninstall(&sw->inst);
-      void *dummy_orig = NULL;
-      int r = nh_hook_install(&sw->inst, sw->target_addr, next->new_addr, &dummy_orig, 0);
+      int r = nh_hook_update_new_func(&sw->inst, next->new_addr);
       if (r != NH_OK) {
-        // critical failure, can't recover cleanly
-        NH_LOG_E("switch: rehook after multi unhook failed: %d", r);
-      }
-      sw->resume_addr = sw->inst.enter;
-      // update all proxies' orig_addr chain: last one should point to new resume_addr
-      for (nh_multi_proxy_t *p = sw->proxies_head; p != NULL; p = p->next) {
-        if (!p->next) {
-          __atomic_store_n(p->orig_addr, sw->resume_addr, __ATOMIC_RELEASE);
-        }
+        NH_LOG_E("switch: update new_func after multi unhook failed: %d", r);
       }
     }
   }
@@ -340,22 +359,33 @@ static int unhook_multi(nh_switch_handle_t *handle) {
 // ============================================================================
 
 static nh_switch_handle_t *hook_shared(uintptr_t target_addr, uintptr_t new_func,
-                                       void **orig_func, size_t sym_size) {
+                                       void **orig_func, size_t sym_size,
+                                       int *out_err) {
   nh_switch_t *sw = find_switch(target_addr);
 
   if (sw != NULL) {
-    if (sw->hook_mode == NH_SWITCH_MODE_UNIQUE) return NULL;  // mode conflict
+    if (sw->hook_mode == NH_SWITCH_MODE_UNIQUE) {
+      if (out_err) *out_err = NH_ERR_MODE_CONFLICT;
+      return NULL;
+    }
 
     // existing SHARED switch — just add proxy to hub
-    if (sw->hub && nh_hub_has_proxy(sw->hub, new_func)) return NULL;  // duplicate
+    if (sw->hub && nh_hub_has_proxy(sw->hub, new_func)) {
+      if (out_err) *out_err = NH_ERR_DUP;
+      return NULL;
+    }
 
     int r = nh_hub_add_proxy(sw->hub, new_func);
-    if (r != 0) return NULL;
+    if (r != 0) { if (out_err) *out_err = r; return NULL; }
 
     if (orig_func) *orig_func = (void *)sw->resume_addr;
 
     nh_switch_handle_t *handle = calloc(1, sizeof(nh_switch_handle_t));
-    if (!handle) { nh_hub_del_proxy(sw->hub, new_func); return NULL; }
+    if (!handle) {
+      nh_hub_del_proxy(sw->hub, new_func);
+      if (out_err) *out_err = NH_ERR_OOM;
+      return NULL;
+    }
 
     handle->sw = sw;
     handle->mode = NH_MODE_SHARED;
@@ -365,20 +395,21 @@ static nh_switch_handle_t *hook_shared(uintptr_t target_addr, uintptr_t new_func
 
   // first SHARED hook on this address: create switch + hub
   sw = calloc(1, sizeof(nh_switch_t));
-  if (!sw) return NULL;
+  if (!sw) { if (out_err) *out_err = NH_ERR_OOM; return NULL; }
   sw->target_addr = target_addr;
   sw->hook_mode = NH_SWITCH_MODE_NONE;
 
   // 1. Create hub with temporary orig_addr=0 (updated after hook install)
   nh_hub_t *hub = NULL;
   int r = nh_hub_create(&hub, 0);
-  if (r != 0) { free(sw); return NULL; }
+  if (r != 0) { if (out_err) *out_err = r; free(sw); return NULL; }
 
   sw->hub = hub;
 
   // 2. Add the proxy function to hub
   r = nh_hub_add_proxy(hub, new_func);
   if (r != 0) {
+    if (out_err) *out_err = r;
     nh_hub_destroy(hub);
     free(sw);
     return NULL;
@@ -388,6 +419,7 @@ static nh_switch_handle_t *hook_shared(uintptr_t target_addr, uintptr_t new_func
   void *hook_orig = NULL;
   r = nh_hook_install(&sw->inst, target_addr, nh_hub_get_trampo(hub), &hook_orig, sym_size);
   if (r != NH_OK) {
+    if (out_err) *out_err = r;
     nh_hub_destroy(hub);
     free(sw);
     return NULL;
@@ -406,7 +438,14 @@ static nh_switch_handle_t *hook_shared(uintptr_t target_addr, uintptr_t new_func
   if (orig_func) *orig_func = (void *)sw->resume_addr;
 
   nh_switch_handle_t *handle = calloc(1, sizeof(nh_switch_handle_t));
-  if (!handle) return NULL;
+  if (!handle) {
+    nh_hub_destroy(hub);
+    sw->hub = NULL;
+    sw->hook_mode = NH_SWITCH_MODE_NONE;
+    destroy_switch(sw);
+    if (out_err) *out_err = NH_ERR_OOM;
+    return NULL;
+  }
 
   handle->sw = sw;
   handle->mode = NH_MODE_SHARED;
@@ -438,35 +477,34 @@ static int unhook_shared(nh_switch_handle_t *handle) {
 // ============================================================================
 
 nh_switch_handle_t *nh_switch_hook(uintptr_t target_addr, uintptr_t new_func,
-                                   void **orig_func, int mode, size_t sym_size) {
+                                   void **orig_func, int mode, size_t sym_size,
+                                   int *out_errno) {
   pthread_mutex_lock(&g_switches_lock);
 
   nh_switch_handle_t *handle = NULL;
 
-  // mode conflict pre-check
+  // mode conflict pre-check: each address can only be in one mode
   nh_switch_t *existing = find_switch(target_addr);
-  if (existing) {
-    if (existing->hook_mode == NH_SWITCH_MODE_UNIQUE && mode != NH_MODE_UNIQUE) {
+  if (existing && existing->hook_mode != NH_SWITCH_MODE_NONE) {
+    if (existing->hook_mode != mode) {
       pthread_mutex_unlock(&g_switches_lock);
-      return NULL;  // caller should set NH_ERR_MODE_CONFLICT
-    }
-    if (existing->hook_mode != NH_SWITCH_MODE_UNIQUE && mode == NH_MODE_UNIQUE) {
-      pthread_mutex_unlock(&g_switches_lock);
+      if (out_errno) *out_errno = NH_ERR_MODE_CONFLICT;
       return NULL;
     }
   }
 
   switch (mode) {
     case NH_MODE_UNIQUE:
-      handle = hook_unique(target_addr, new_func, orig_func, sym_size);
+      handle = hook_unique(target_addr, new_func, orig_func, sym_size, out_errno);
       break;
     case NH_MODE_MULTI:
-      handle = hook_multi(target_addr, new_func, orig_func, sym_size);
+      handle = hook_multi(target_addr, new_func, orig_func, sym_size, out_errno);
       break;
     case NH_MODE_SHARED:
-      handle = hook_shared(target_addr, new_func, orig_func, sym_size);
+      handle = hook_shared(target_addr, new_func, orig_func, sym_size, out_errno);
       break;
     default:
+      if (out_errno) *out_errno = NH_ERR_INVALID_ARG;
       break;
   }
 

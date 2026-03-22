@@ -274,7 +274,7 @@ int nh_hook_uninstall(nh_hook_t *hook) {
 
   bool write_ok = true;
   NH_SAFE_TRY() {
-    memcpy((void *)target, hook->backup, backup_len);
+    nh_util_write_inst(target, hook->backup, backup_len);
   }
   NH_SAFE_CATCH() {
     write_ok = false;
@@ -295,5 +295,29 @@ int nh_hook_uninstall(nh_hook_t *hook) {
   hook->hooked = false;
 
   NH_LOG_I("hook: uninstalled target=%p", (void *)target);
+  return NH_OK;
+}
+
+int nh_hook_update_new_func(nh_hook_t *hook, uintptr_t new_func) {
+  if (!hook->hooked) return NH_ERR_NOT_HOOKED;
+
+  // The .quad address is always at offset +8 from the jump sequence start.
+  // Strategy A (island): island_exit = LDR X17,[PC,#8]; BR X17; .quad addr
+  // Strategy B (no-island): target = LDR X17,[PC,#8]; BR X17; .quad addr
+  uintptr_t addr_loc;
+  if (hook->with_island) {
+    addr_loc = hook->island_exit + 8;
+  } else {
+    addr_loc = hook->target_addr + 8;
+  }
+
+  // Atomic 8-byte write to update the target address
+  __atomic_store_n((uint64_t *)addr_loc, (uint64_t)new_func, __ATOMIC_SEQ_CST);
+  nh_util_flush_cache(addr_loc, 8);
+
+  hook->new_func = new_func;
+
+  NH_LOG_D("hook: updated target=%p -> new_func=%p",
+           (void *)hook->target_addr, (void *)new_func);
   return NH_OK;
 }

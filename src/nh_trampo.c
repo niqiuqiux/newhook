@@ -33,7 +33,7 @@ static uintptr_t try_alloc_from_page(nh_trampo_page_t *page, size_t chunk_size,
 
     // check timestamp delay
     uint32_t ts = flag & 0x7FFFFFFF;
-    if (ts != 0 && (now <= ts || now - ts <= delay_sec)) continue;
+    if (ts != 0 && (now <= ts || now - ts < delay_sec)) continue;
 
     // mark as used
     page->flags[i] = 0x80000000;

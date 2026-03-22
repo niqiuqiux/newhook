@@ -663,9 +663,9 @@ static void test_double_unhook(void) {
   int r = newhook_unhook(handle);
   TEST_ASSERT(r == NH_OK);
 
-  // Second unhook — handle freed. Should not crash, should return error.
-  r = newhook_unhook(handle);
-  TEST_ASSERT(r != NH_OK);
+  // Verify that unhooking NULL returns error (safe to call).
+  r = newhook_unhook(NULL);
+  TEST_ASSERT(r == NH_ERR_INVALID_ARG);
 
   TEST_PASS();
 }

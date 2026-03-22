@@ -13,8 +13,10 @@ void nh_switch_init(void);
 // Hook target_addr with new_func in the given mode.
 // On success, *orig_func is set and a handle is returned.
 // sym_size: size of target symbol (0 if unknown).
+// out_errno: if non-NULL, receives the specific error code on failure.
 nh_switch_handle_t *nh_switch_hook(uintptr_t target_addr, uintptr_t new_func,
-                                   void **orig_func, int mode, size_t sym_size);
+                                   void **orig_func, int mode, size_t sym_size,
+                                   int *out_errno);
 
 // Unhook a previously installed hook.
 int nh_switch_unhook(nh_switch_handle_t *handle);

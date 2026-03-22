@@ -172,7 +172,7 @@ static uint32_t make_nop(void) {
 static size_t emit_abs_load_reg(uint32_t *buf, uint32_t rd, uint64_t value) {
   buf[0] = make_ldr_lit_x(rd, 8);         // LDR Xd, [PC, #8]
   buf[1] = make_b(12);                     // B .+12  (skip 8 bytes of data)
-  *((uint64_t *)&buf[2]) = value;          // .quad value
+  memcpy(&buf[2], &value, sizeof(value));  // .quad value
   return 16;
 }
 
@@ -189,7 +189,7 @@ static size_t emit_cond_abs_jump(uint32_t *buf, uint32_t inv_cond_inst, uint64_t
   buf[0] = inv_cond_inst;                  // inverted condition → skip
   buf[1] = make_ldr_lit_x(17, 8);         // LDR X17, [PC, #8]
   buf[2] = 0xD61F0220;                     // BR X17
-  *((uint64_t *)&buf[3]) = target;         // .quad target
+  memcpy(&buf[3], &target, sizeof(target));// .quad target
   return 20;
 }
 
@@ -200,7 +200,8 @@ static size_t emit_cond_abs_jump(uint32_t *buf, uint32_t inv_cond_inst, uint64_t
 size_t nh_a64_make_abs_jump(uint32_t *buf, uintptr_t addr) {
   buf[0] = make_ldr_lit_x(17, 8);         // LDR X17, [PC, #8]
   buf[1] = 0xD61F0220;                     // BR X17
-  *((uint64_t *)&buf[2]) = (uint64_t)addr; // .quad addr
+  uint64_t addr64 = (uint64_t)addr;
+  memcpy(&buf[2], &addr64, sizeof(addr64));// .quad addr
   return 16;
 }
 
@@ -240,7 +241,7 @@ size_t nh_a64_rewrite(uint32_t *buf, uint32_t inst, uintptr_t old_pc, uintptr_t 
     // Out of range: inline absolute jump
     buf[0] = make_ldr_lit_x(17, 8);
     buf[1] = 0xD61F0220;  // BR X17
-    *((uint64_t *)&buf[2]) = (uint64_t)target;
+    { uint64_t t64 = (uint64_t)target; memcpy(&buf[2], &t64, sizeof(t64)); }
     return 16;
   }
 
@@ -255,7 +256,7 @@ size_t nh_a64_rewrite(uint32_t *buf, uint32_t inst, uintptr_t old_pc, uintptr_t 
     // Out of range: LDR X17, #8; BLR X17; .quad target
     buf[0] = make_ldr_lit_x(17, 8);
     buf[1] = 0xD63F0220;  // BLR X17
-    *((uint64_t *)&buf[2]) = (uint64_t)target;
+    { uint64_t t64 = (uint64_t)target; memcpy(&buf[2], &t64, sizeof(t64)); }
     return 16;
   }
 

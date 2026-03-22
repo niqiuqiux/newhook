@@ -66,7 +66,8 @@ static void task_dl_init_pre(struct dl_phdr_info *info, size_t size, void *data)
 
     // install hook via switch
     nh_switch_handle_t *sh = nh_switch_hook(
-        sym_info.addr, task->new_func, task->orig_func, task->mode, sym_info.size);
+        sym_info.addr, task->new_func, task->orig_func, task->mode, sym_info.size,
+        NULL);
 
     if (sh) {
       task->switch_handle = sh;
@@ -159,8 +160,16 @@ int nh_task_destroy(nh_task_t *task) {
 
 int nh_task_is_task(void *handle) {
   if (!handle) return 0;
-  nh_task_t *task = (nh_task_t *)handle;
-  return task->magic == NH_TASK_MAGIC;
+
+  // Validate by checking if handle is in the global task list.
+  // This avoids dereferencing arbitrary user pointers.
+  int found = 0;
+  pthread_mutex_lock(&g_tasks_lock);
+  for (nh_task_t *t = g_tasks; t != NULL; t = t->next) {
+    if (t == handle) { found = 1; break; }
+  }
+  pthread_mutex_unlock(&g_tasks_lock);
+  return found;
 }
 
 void *nh_task_get_switch_handle(nh_task_t *task) {

@@ -89,18 +89,13 @@ void *newhook_hook_func_addr_ex(void *target_addr, void *new_func,
     sym_size = sym_info.size;
   }
 
+  int sw_err = NH_OK;
   nh_switch_handle_t *handle = nh_switch_hook(
-      (uintptr_t)target_addr, (uintptr_t)new_func, orig_func, mode, sym_size);
+      (uintptr_t)target_addr, (uintptr_t)new_func, orig_func, mode, sym_size,
+      &sw_err);
 
   if (!handle) {
-    // determine specific error
-    if (mode == NH_MODE_UNIQUE) {
-      set_errno(NH_ERR_ALREADY_HOOKED);
-    } else if (mode == NH_MODE_SHARED) {
-      set_errno(NH_ERR_HUB);
-    } else {
-      set_errno(NH_ERR_MODE_CONFLICT);
-    }
+    set_errno(sw_err);
     return NULL;
   }
 
@@ -136,15 +131,13 @@ void *newhook_hook_sym_name_ex(const char *lib_name, const char *sym_name,
     return fail(NH_ERR_SYMBOL_NOT_FOUND);
   }
 
+  int sw_err = NH_OK;
   nh_switch_handle_t *handle = nh_switch_hook(
-      sym_info.addr, (uintptr_t)new_func, orig_func, mode, sym_info.size);
+      sym_info.addr, (uintptr_t)new_func, orig_func, mode, sym_info.size,
+      &sw_err);
 
   if (!handle) {
-    if (mode == NH_MODE_UNIQUE) {
-      set_errno(NH_ERR_ALREADY_HOOKED);
-    } else {
-      set_errno(NH_ERR_MODE_CONFLICT);
-    }
+    set_errno(sw_err);
     return NULL;
   }
 
